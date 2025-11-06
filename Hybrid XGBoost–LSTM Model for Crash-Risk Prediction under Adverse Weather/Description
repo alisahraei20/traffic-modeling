@@ -8,3 +8,5 @@ XGBoost (Stage 1) for learning complex nonlinear relations between traffic + wea
 LSTM (Stage 2) for capturing temporal dependencies across recent time intervals using the XGBoost risk score sequence.
 
 This hybrid design enhances early-warning capabilities for traffic-safety and Intelligent Transportation System (ITS) applications.
+
+Note: The data is created by the AI platforms. 
