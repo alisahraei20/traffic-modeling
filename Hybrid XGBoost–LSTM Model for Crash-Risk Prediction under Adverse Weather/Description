@@ -1,0 +1,10 @@
+Overview
+
+This repository contains the complete implementation of a Hybrid XGBoost–LSTM framework for predicting traffic accident risk under adverse weather and dynamic traffic conditions.
+The model combines:
+
+XGBoost (Stage 1) for learning complex nonlinear relations between traffic + weather features and crash likelihood, and
+
+LSTM (Stage 2) for capturing temporal dependencies across recent time intervals using the XGBoost risk score sequence.
+
+This hybrid design enhances early-warning capabilities for traffic-safety and Intelligent Transportation System (ITS) applications.
