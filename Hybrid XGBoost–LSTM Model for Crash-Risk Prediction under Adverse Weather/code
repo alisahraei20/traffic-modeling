@@ -1,11 +1,15 @@
 # Hybrid XGBoost + LSTM Crash Risk under Adverse Weather
+# Uses: traffic_accident_prediction_example_30days.xlsx
 
-import pandas as pd
 import numpy as np
+import pandas as pd
 import xgboost as xgb
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
+
+import matplotlib.pyplot as plt
+
 from sklearn.utils.class_weight import compute_class_weight
 from sklearn.metrics import (
     roc_auc_score,
@@ -13,6 +17,12 @@ from sklearn.metrics import (
     precision_score,
     recall_score,
     classification_report,
+    r2_score,
+    mean_squared_error,
+    mean_absolute_error,
+    roc_curve,
+    precision_recall_curve,
+    average_precision_score,
 )
 
 # ----------------------------------------------------
@@ -64,6 +74,7 @@ y_test = y_tab[n_train + n_val:]
 
 print(f"Train rows: {len(X_train_tab)}, Val rows: {len(X_val_tab)}, Test rows: {len(X_test_tab)}")
 
+
 # ----------------------------------------------------
 # 3. Train XGBoost for crash probability (stage 1)
 # ----------------------------------------------------
@@ -74,11 +85,12 @@ def compute_pos_weight(y):
         return 1.0
     return float(neg) / float(pos)  # N_neg / N_pos
 
+
 scale_pos_weight = compute_pos_weight(y_train)
 print(f"XGBoost scale_pos_weight (N_neg/N_pos): {scale_pos_weight:.2f}")
 
 dtrain = xgb.DMatrix(X_train_tab, label=y_train)
-dval   = xgb.DMatrix(X_val_tab,   label=y_val)
+dval = xgb.DMatrix(X_val_tab, label=y_val)
 
 params = {
     "objective": "binary:logistic",
@@ -106,16 +118,19 @@ df["xgb_score"] = bst.predict(dall)
 print("XGBoost stage done. Example scores:")
 print(df[["time", "xgb_score"]].head())
 
+
 # ----------------------------------------------------
 # 4. Build sequences for LSTM (stage 2)
 # ----------------------------------------------------
-L = 8  # lookback window length (number of past intervals)
-seq_feature_cols = feature_cols_tab  # you can reduce if you want
+L = 8  # lookback window length
+seq_feature_cols = feature_cols_tab  # can reduce if desired
+
 
 def build_sequences(df_slice, L, seq_feature_cols, target_col, label_name="split"):
     """
     df_slice: slice of df (train / val / test, time-sorted)
-    returns X_seq [samples, L, D], y_seq [samples]
+    returns:
+        X_seq [samples, L, D], y_seq [samples]
     """
     arr_feats = df_slice[seq_feature_cols].values          # [T_slice, F]
     arr_score = df_slice["xgb_score"].values.reshape(-1, 1)  # [T_slice, 1]
@@ -143,15 +158,16 @@ def build_sequences(df_slice, L, seq_feature_cols, target_col, label_name="split
     print(f"{label_name} sequences: X_seq={X_seq.shape}, y_seq={y_seq.shape}")
     return X_seq, y_seq
 
+
 df_train = df.iloc[:n_train].reset_index(drop=True)
-df_val   = df.iloc[n_train:n_train + n_val].reset_index(drop=True)
-df_test  = df.iloc[n_train + n_val:].reset_index(drop=True)
+df_val = df.iloc[n_train:n_train + n_val].reset_index(drop=True)
+df_test = df.iloc[n_train + n_val:].reset_index(drop=True)
 
 X_train_seq, y_train_seq = build_sequences(df_train, L, seq_feature_cols, target_col, label_name="Train")
-X_val_seq,   y_val_seq   = build_sequences(df_val,   L, seq_feature_cols, target_col, label_name="Val")
-X_test_seq,  y_test_seq  = build_sequences(df_test,  L, seq_feature_cols, target_col, label_name="Test")
+X_val_seq, y_val_seq = build_sequences(df_val, L, seq_feature_cols, target_col, label_name="Val")
+X_test_seq, y_test_seq = build_sequences(df_test, L, seq_feature_cols, target_col, label_name="Test")
 
-# Label distributions at sequence level
+
 def print_label_stats(name, y_array):
     flat = y_array.ravel()
     unique, counts = np.unique(flat, return_counts=True)
@@ -160,9 +176,11 @@ def print_label_stats(name, y_array):
         print(f"  class {u}: {c} samples")
     print()
 
+
 print_label_stats("Train", y_train_seq)
-print_label_stats("Val",   y_val_seq)
-print_label_stats("Test",  y_test_seq)
+print_label_stats("Val", y_val_seq)
+print_label_stats("Test", y_test_seq)
+
 
 # ----------------------------------------------------
 # 5. PyTorch Dataset & DataLoader for LSTM stage
@@ -178,18 +196,21 @@ class SeqDataset(Dataset):
     def __getitem__(self, idx):
         return self.X[idx], self.y[idx]
 
+
 train_ds = SeqDataset(X_train_seq, y_train_seq)
-val_ds   = SeqDataset(X_val_seq,   y_val_seq)
-test_ds  = SeqDataset(X_test_seq,  y_test_seq)
+val_ds = SeqDataset(X_val_seq, y_val_seq)
+test_ds = SeqDataset(X_test_seq, y_test_seq)
 
 train_loader = DataLoader(train_ds, batch_size=64, shuffle=True)
-val_loader   = DataLoader(val_ds,   batch_size=64, shuffle=False)
-test_loader  = DataLoader(test_ds,  batch_size=64, shuffle=False)
+val_loader = DataLoader(val_ds, batch_size=64, shuffle=False)
+test_loader = DataLoader(test_ds, batch_size=64, shuffle=False)
+
 
 # ----------------------------------------------------
 # 6. Define LSTM model (stage 2)
 # ----------------------------------------------------
 input_dim = 1 + len(seq_feature_cols)  # xgb_score + features
+
 
 class XGB_LSTM(nn.Module):
     def __init__(self, input_dim, lstm_hidden_dim=64):
@@ -200,21 +221,23 @@ class XGB_LSTM(nn.Module):
             batch_first=True
         )
         self.fc1 = nn.Linear(lstm_hidden_dim, 32)
-        self.fc2 = nn.Linear(32, 1)  # 1 logit (crash vs no-crash)
+        self.fc2 = nn.Linear(32, 1)  # 1 logit
 
     def forward(self, x):
         """
         x: [B, L, D]
         returns logits: [B]
         """
-        lstm_out, _ = self.lstm(x)               # [B, L, H]
-        last_hidden = lstm_out[:, -1, :]         # [B, H]
-        h = torch.relu(self.fc1(last_hidden))    # [B, 32]
-        logits = self.fc2(h).squeeze(-1)         # [B]
+        lstm_out, _ = self.lstm(x)        # [B, L, H]
+        last_hidden = lstm_out[:, -1, :]  # [B, H]
+        h = torch.relu(self.fc1(last_hidden))
+        logits = self.fc2(h).squeeze(-1)  # [B]
         return logits
+
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model = XGB_LSTM(input_dim=input_dim, lstm_hidden_dim=64).to(device)
+
 
 # ----------------------------------------------------
 # 7. Class-weighted loss for LSTM stage
@@ -240,6 +263,7 @@ pos_weight_tensor = torch.tensor([pos_w], dtype=torch.float32).to(device)
 criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight_tensor)
 optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
+
 # ----------------------------------------------------
 # 8. Training loop for LSTM stage
 # ----------------------------------------------------
@@ -260,8 +284,8 @@ def run_epoch(loader, train=True):
             if train:
                 optimizer.zero_grad()
 
-            logits = model(X_batch)             # [B]
-            loss = criterion(logits, y_batch)   # BCEWithLogits
+            logits = model(X_batch)
+            loss = criterion(logits, y_batch)
 
             if train:
                 loss.backward()
@@ -274,15 +298,24 @@ def run_epoch(loader, train=True):
         return float("nan")
     return total_loss / total_samples
 
-num_epochs = 10  # you can increase to 20–30 later
+
+num_epochs = 10  # can increase to 20–30
+
+train_losses = []
+val_losses = []
 
 for epoch in range(1, num_epochs + 1):
     train_loss = run_epoch(train_loader, train=True)
     val_loss = run_epoch(val_loader, train=False)
+
+    train_losses.append(train_loss)
+    val_losses.append(val_loss)
+
     print(f"Epoch {epoch}: train_loss={train_loss:.4f}, val_loss={val_loss:.4f}")
 
+
 # ----------------------------------------------------
-# 9. Evaluation on test set
+# 9. Evaluation on test set + plots
 # ----------------------------------------------------
 model.eval()
 all_probs = []
@@ -306,23 +339,112 @@ else:
     print("Test sequence-level shapes:", y_pred_flat.shape, y_true_flat.shape)
 
     if len(np.unique(y_true_flat)) > 1:
-        auc = roc_auc_score(y_true_flat, y_pred_flat)
-        print(f"Global AUC (LSTM stage): {auc:.3f}")
+        # -------------------------
+        # 1) Classification metrics
+        # -------------------------
+        auc_val = roc_auc_score(y_true_flat, y_pred_flat)
+        print(f"Global AUC (LSTM stage): {auc_val:.3f}")
 
-        for thr in [0.5, 0.4, 0.35, 0.3]:
+        for thr in [0.50, 0.40, 0.35, 0.30]:
             y_pred_binary = (y_pred_flat >= thr).astype(int)
             p = precision_score(y_true_flat, y_pred_binary, zero_division=0)
             r = recall_score(y_true_flat, y_pred_binary, zero_division=0)
             f1 = f1_score(y_true_flat, y_pred_binary, zero_division=0)
             print(f"thr={thr:.2f} -> precision={p:.3f}, recall={r:.3f}, f1={f1:.3f}")
 
-        y_pred_binary = (y_pred_flat >= 0.4).astype(int)
-        print("\nClassification report (threshold=0.4):")
+        thr_rep = 0.40
+        y_pred_binary = (y_pred_flat >= thr_rep).astype(int)
+        print(f"\nClassification report (threshold={thr_rep}):")
         print(classification_report(y_true_flat, y_pred_binary, digits=3, zero_division=0))
+
+        # -------------------------
+        # 2) Continuous risk metrics
+        # -------------------------
+        r2 = r2_score(y_true_flat, y_pred_flat)
+        rmse = mean_squared_error(y_true_flat, y_pred_flat, squared=False)
+        mae = mean_absolute_error(y_true_flat, y_pred_flat)
+
+        print("\n--- Continuous Risk Metrics ---")
+        print(f"R² (coefficient of determination): {r2:.3f}")
+        print(f"RMSE (root mean square error): {rmse:.3f}")
+        print(f"MAE  (mean absolute error): {mae:.3f}")
+
+        # -------------------------
+        # 3) Loss curves plot
+        # -------------------------
+        epochs_range = range(1, len(train_losses) + 1)
+        plt.figure()
+        plt.plot(epochs_range, train_losses, label="Train loss")
+        plt.plot(epochs_range, val_losses, label="Validation loss")
+        plt.xlabel("Epoch")
+        plt.ylabel("Loss")
+        plt.title("LSTM Training & Validation Loss")
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig("lstm_loss_curves.png", dpi=300)
+        plt.close()
+
+        # -------------------------
+        # 4) ROC curve plot
+        # -------------------------
+        fpr, tpr, _ = roc_curve(y_true_flat, y_pred_flat)
+        roc_auc = auc_val
+
+        plt.figure()
+        plt.plot(fpr, tpr, label=f"ROC curve (AUC = {roc_auc:.3f})")
+        plt.plot([0, 1], [0, 1], linestyle="--", label="Random guess")
+        plt.xlabel("False Positive Rate")
+        plt.ylabel("True Positive Rate (Recall)")
+        plt.title("ROC Curve - Hybrid XGBoost–LSTM")
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig("roc_curve_hybrid.png", dpi=300)
+        plt.close()
+
+        # -------------------------
+        # 5) Precision-Recall curve
+        # -------------------------
+        prec, rec, _ = precision_recall_curve(y_true_flat, y_pred_flat)
+        ap = average_precision_score(y_true_flat, y_pred_flat)
+
+        plt.figure()
+        plt.plot(rec, prec, label=f"PR curve (AP = {ap:.3f})")
+        plt.xlabel("Recall")
+        plt.ylabel("Precision")
+        plt.title("Precision–Recall Curve - Hybrid XGBoost–LSTM")
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig("pr_curve_hybrid.png", dpi=300)
+        plt.close()
+
+        # -------------------------
+        # 6) Risk distribution by class
+        # -------------------------
+        plt.figure()
+        plt.hist(
+            y_pred_flat[y_true_flat == 0],
+            bins=30,
+            alpha=0.7,
+            label="No crash (0)",
+        )
+        plt.hist(
+            y_pred_flat[y_true_flat == 1],
+            bins=30,
+            alpha=0.7,
+            label="Crash (1)",
+        )
+        plt.xlabel("Predicted crash probability")
+        plt.ylabel("Count")
+        plt.title("Predicted Crash Risk Distribution by Class")
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig("risk_histogram_by_class.png", dpi=300)
+        plt.close()
+
     else:
         print("Warning: Only one class present in test labels; AUC/F1 not defined.")
 
-    # Show a few sample predictions
+    # Sample predictions
     print("\nSample predictions vs true (first 10 sequences):")
     for i in range(min(10, len(y_pred_flat))):
         print(f"Seq {i}: pred={y_pred_flat[i]:.3f}, true={int(y_true_flat[i])}")
