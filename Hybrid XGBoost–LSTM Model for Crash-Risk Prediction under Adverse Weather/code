@@ -1,0 +1,328 @@
+# Hybrid XGBoost + LSTM Crash Risk under Adverse Weather
+
+import pandas as pd
+import numpy as np
+import xgboost as xgb
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from sklearn.utils.class_weight import compute_class_weight
+from sklearn.metrics import (
+    roc_auc_score,
+    f1_score,
+    precision_score,
+    recall_score,
+    classification_report,
+)
+
+# ----------------------------------------------------
+# 1. Load Excel (Pipeline B sheet: single corridor/site)
+# ----------------------------------------------------
+excel_path = r"C:\Users\mohammad.a\OneDrive - University of Buraimi\Desktop\Accident hybrid modeling\traffic_accident_prediction_example_30days.xlsx"
+
+df = pd.read_excel(excel_path, sheet_name="PipelineB_Corridor")
+df["time"] = pd.to_datetime(df["time"])
+df = df.sort_values("time").reset_index(drop=True)
+
+print("Total rows:", len(df))
+
+# ----------------------------------------------------
+# 2. Prepare tabular features for XGBoost (stage 1)
+# ----------------------------------------------------
+feature_cols_tab = [
+    "speed_kmh",
+    "flow_veh_h",
+    "occupancy_pct",
+    "speed_variance",
+    "rain_intensity_mm_h",
+    "visibility_km",
+    "temperature_C",
+    "time_of_day_h",
+    "day_of_week",
+    "speed_limit_kmh",
+]
+target_col = "label_crash_next"
+
+X_tab = df[feature_cols_tab].values
+y_tab = df[target_col].values
+
+T = len(df)
+
+# Time-based split: 60% train, 20% val, 20% test
+n_train = int(T * 0.6)
+n_val = int(T * 0.2)
+n_test = T - n_train - n_val
+
+X_train_tab = X_tab[:n_train]
+y_train = y_tab[:n_train]
+
+X_val_tab = X_tab[n_train:n_train + n_val]
+y_val = y_tab[n_train:n_train + n_val]
+
+X_test_tab = X_tab[n_train + n_val:]
+y_test = y_tab[n_train + n_val:]
+
+print(f"Train rows: {len(X_train_tab)}, Val rows: {len(X_val_tab)}, Test rows: {len(X_test_tab)}")
+
+# ----------------------------------------------------
+# 3. Train XGBoost for crash probability (stage 1)
+# ----------------------------------------------------
+def compute_pos_weight(y):
+    pos = np.sum(y == 1)
+    neg = np.sum(y == 0)
+    if pos == 0:
+        return 1.0
+    return float(neg) / float(pos)  # N_neg / N_pos
+
+scale_pos_weight = compute_pos_weight(y_train)
+print(f"XGBoost scale_pos_weight (N_neg/N_pos): {scale_pos_weight:.2f}")
+
+dtrain = xgb.DMatrix(X_train_tab, label=y_train)
+dval   = xgb.DMatrix(X_val_tab,   label=y_val)
+
+params = {
+    "objective": "binary:logistic",
+    "eval_metric": "auc",
+    "eta": 0.05,
+    "max_depth": 4,
+    "subsample": 0.8,
+    "colsample_bytree": 0.8,
+    "scale_pos_weight": scale_pos_weight,
+}
+
+bst = xgb.train(
+    params,
+    dtrain,
+    num_boost_round=300,
+    evals=[(dtrain, "train"), (dval, "val")],
+    early_stopping_rounds=30,
+    verbose_eval=50,
+)
+
+# Predict XGBoost probabilities for all time steps
+dall = xgb.DMatrix(X_tab)
+df["xgb_score"] = bst.predict(dall)
+
+print("XGBoost stage done. Example scores:")
+print(df[["time", "xgb_score"]].head())
+
+# ----------------------------------------------------
+# 4. Build sequences for LSTM (stage 2)
+# ----------------------------------------------------
+L = 8  # lookback window length (number of past intervals)
+seq_feature_cols = feature_cols_tab  # you can reduce if you want
+
+def build_sequences(df_slice, L, seq_feature_cols, target_col, label_name="split"):
+    """
+    df_slice: slice of df (train / val / test, time-sorted)
+    returns X_seq [samples, L, D], y_seq [samples]
+    """
+    arr_feats = df_slice[seq_feature_cols].values          # [T_slice, F]
+    arr_score = df_slice["xgb_score"].values.reshape(-1, 1)  # [T_slice, 1]
+    labels = df_slice[target_col].values                   # [T_slice]
+
+    T_slice = arr_feats.shape[0]
+    X_list = []
+    y_list = []
+
+    for t in range(L, T_slice):
+        # history window [t-L, ..., t-1]
+        window_feats = arr_feats[t - L:t]   # [L, F]
+        window_score = arr_score[t - L:t]   # [L, 1]
+        window = np.hstack([window_score, window_feats])  # [L, 1+F]
+
+        X_list.append(window.astype(np.float32))
+        y_list.append(float(labels[t]))  # label at time t
+
+    if len(X_list) == 0:
+        print(f"⚠️ No sequences created for {label_name} split (T_slice={T_slice}, L={L})")
+        return np.zeros((0, L, 1 + len(seq_feature_cols)), dtype=np.float32), np.zeros((0,), dtype=np.float32)
+
+    X_seq = np.stack(X_list, axis=0)  # [N_seq, L, 1+F]
+    y_seq = np.array(y_list, dtype=np.float32)
+    print(f"{label_name} sequences: X_seq={X_seq.shape}, y_seq={y_seq.shape}")
+    return X_seq, y_seq
+
+df_train = df.iloc[:n_train].reset_index(drop=True)
+df_val   = df.iloc[n_train:n_train + n_val].reset_index(drop=True)
+df_test  = df.iloc[n_train + n_val:].reset_index(drop=True)
+
+X_train_seq, y_train_seq = build_sequences(df_train, L, seq_feature_cols, target_col, label_name="Train")
+X_val_seq,   y_val_seq   = build_sequences(df_val,   L, seq_feature_cols, target_col, label_name="Val")
+X_test_seq,  y_test_seq  = build_sequences(df_test,  L, seq_feature_cols, target_col, label_name="Test")
+
+# Label distributions at sequence level
+def print_label_stats(name, y_array):
+    flat = y_array.ravel()
+    unique, counts = np.unique(flat, return_counts=True)
+    print(f"{name} sequence label distribution:")
+    for u, c in zip(unique, counts):
+        print(f"  class {u}: {c} samples")
+    print()
+
+print_label_stats("Train", y_train_seq)
+print_label_stats("Val",   y_val_seq)
+print_label_stats("Test",  y_test_seq)
+
+# ----------------------------------------------------
+# 5. PyTorch Dataset & DataLoader for LSTM stage
+# ----------------------------------------------------
+class SeqDataset(Dataset):
+    def __init__(self, X, y):
+        self.X = torch.from_numpy(X)  # [B, L, D]
+        self.y = torch.from_numpy(y)  # [B]
+
+    def __len__(self):
+        return self.X.shape[0]
+
+    def __getitem__(self, idx):
+        return self.X[idx], self.y[idx]
+
+train_ds = SeqDataset(X_train_seq, y_train_seq)
+val_ds   = SeqDataset(X_val_seq,   y_val_seq)
+test_ds  = SeqDataset(X_test_seq,  y_test_seq)
+
+train_loader = DataLoader(train_ds, batch_size=64, shuffle=True)
+val_loader   = DataLoader(val_ds,   batch_size=64, shuffle=False)
+test_loader  = DataLoader(test_ds,  batch_size=64, shuffle=False)
+
+# ----------------------------------------------------
+# 6. Define LSTM model (stage 2)
+# ----------------------------------------------------
+input_dim = 1 + len(seq_feature_cols)  # xgb_score + features
+
+class XGB_LSTM(nn.Module):
+    def __init__(self, input_dim, lstm_hidden_dim=64):
+        super().__init__()
+        self.lstm = nn.LSTM(
+            input_size=input_dim,
+            hidden_size=lstm_hidden_dim,
+            batch_first=True
+        )
+        self.fc1 = nn.Linear(lstm_hidden_dim, 32)
+        self.fc2 = nn.Linear(32, 1)  # 1 logit (crash vs no-crash)
+
+    def forward(self, x):
+        """
+        x: [B, L, D]
+        returns logits: [B]
+        """
+        lstm_out, _ = self.lstm(x)               # [B, L, H]
+        last_hidden = lstm_out[:, -1, :]         # [B, H]
+        h = torch.relu(self.fc1(last_hidden))    # [B, 32]
+        logits = self.fc2(h).squeeze(-1)         # [B]
+        return logits
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = XGB_LSTM(input_dim=input_dim, lstm_hidden_dim=64).to(device)
+
+# ----------------------------------------------------
+# 7. Class-weighted loss for LSTM stage
+# ----------------------------------------------------
+if len(y_train_seq) > 0:
+    classes = np.array([0, 1], dtype=np.int64)
+    try:
+        class_weights = compute_class_weight(
+            class_weight="balanced",
+            classes=classes,
+            y=y_train_seq.astype(int)
+        )
+        neg_w, pos_w = class_weights
+        print(f"LSTM class weights -> Neg: {neg_w:.2f}, Pos: {pos_w:.2f}")
+    except Exception as e:
+        neg_w, pos_w = 1.0, 1.0
+        print("⚠️ Using default LSTM class weights (1.0, 1.0) because:", e)
+else:
+    neg_w, pos_w = 1.0, 1.0
+    print("⚠️ No training sequences, falling back to default class weights.")
+
+pos_weight_tensor = torch.tensor([pos_w], dtype=torch.float32).to(device)
+criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight_tensor)
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+# ----------------------------------------------------
+# 8. Training loop for LSTM stage
+# ----------------------------------------------------
+def run_epoch(loader, train=True):
+    if train:
+        model.train()
+    else:
+        model.eval()
+
+    total_loss = 0.0
+    total_samples = 0
+
+    with torch.set_grad_enabled(train):
+        for X_batch, y_batch in loader:
+            X_batch = X_batch.to(device)
+            y_batch = y_batch.to(device)
+
+            if train:
+                optimizer.zero_grad()
+
+            logits = model(X_batch)             # [B]
+            loss = criterion(logits, y_batch)   # BCEWithLogits
+
+            if train:
+                loss.backward()
+                optimizer.step()
+
+            total_loss += loss.item() * X_batch.size(0)
+            total_samples += X_batch.size(0)
+
+    if total_samples == 0:
+        return float("nan")
+    return total_loss / total_samples
+
+num_epochs = 10  # you can increase to 20–30 later
+
+for epoch in range(1, num_epochs + 1):
+    train_loss = run_epoch(train_loader, train=True)
+    val_loss = run_epoch(val_loader, train=False)
+    print(f"Epoch {epoch}: train_loss={train_loss:.4f}, val_loss={val_loss:.4f}")
+
+# ----------------------------------------------------
+# 9. Evaluation on test set
+# ----------------------------------------------------
+model.eval()
+all_probs = []
+all_true = []
+
+with torch.no_grad():
+    for X_batch, y_batch in test_loader:
+        X_batch = X_batch.to(device)
+        y_batch = y_batch.to(device)
+        logits = model(X_batch)               # [B]
+        probs = torch.sigmoid(logits)         # [B]
+        all_probs.append(probs.cpu().numpy())
+        all_true.append(y_batch.cpu().numpy())
+
+if len(all_probs) == 0:
+    print("⚠️ No test sequences to evaluate.")
+else:
+    y_pred_flat = np.concatenate(all_probs, axis=0)
+    y_true_flat = np.concatenate(all_true, axis=0)
+
+    print("Test sequence-level shapes:", y_pred_flat.shape, y_true_flat.shape)
+
+    if len(np.unique(y_true_flat)) > 1:
+        auc = roc_auc_score(y_true_flat, y_pred_flat)
+        print(f"Global AUC (LSTM stage): {auc:.3f}")
+
+        for thr in [0.5, 0.4, 0.35, 0.3]:
+            y_pred_binary = (y_pred_flat >= thr).astype(int)
+            p = precision_score(y_true_flat, y_pred_binary, zero_division=0)
+            r = recall_score(y_true_flat, y_pred_binary, zero_division=0)
+            f1 = f1_score(y_true_flat, y_pred_binary, zero_division=0)
+            print(f"thr={thr:.2f} -> precision={p:.3f}, recall={r:.3f}, f1={f1:.3f}")
+
+        y_pred_binary = (y_pred_flat >= 0.4).astype(int)
+        print("\nClassification report (threshold=0.4):")
+        print(classification_report(y_true_flat, y_pred_binary, digits=3, zero_division=0))
+    else:
+        print("Warning: Only one class present in test labels; AUC/F1 not defined.")
+
+    # Show a few sample predictions
+    print("\nSample predictions vs true (first 10 sequences):")
+    for i in range(min(10, len(y_pred_flat))):
+        print(f"Seq {i}: pred={y_pred_flat[i]:.3f}, true={int(y_true_flat[i])}")
