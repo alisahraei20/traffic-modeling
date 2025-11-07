@@ -1,13 +1,16 @@
-# Hybrid XGBoost + LSTM Crash Risk under Adverse Weather
-# Uses: traffic_accident_prediction_example_30days.xlsx
+# =========================================================
+# HYBRID XGBOOST + LSTM CRASH-RISK MODEL UNDER ADVERSE WEATHER
+# =========================================================
 
+# ============ SECTION 0: IMPORTS ============
+
+import os
 import numpy as np
 import pandas as pd
 import xgboost as xgb
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
-
 import matplotlib.pyplot as plt
 
 from sklearn.utils.class_weight import compute_class_weight
@@ -25,10 +28,22 @@ from sklearn.metrics import (
     average_precision_score,
 )
 
-# ----------------------------------------------------
-# 1. Load Excel (Pipeline B sheet: single corridor/site)
-# ----------------------------------------------------
-excel_path = r"C:\Users\mohammad.a\OneDrive - University of Buraimi\Desktop\Accident hybrid modeling\traffic_accident_prediction_example_30days.xlsx"
+# ============ SECTION 0B: CONFIG & PATHS (INCLUDING OUTPUT DIRECTORY) ============
+
+# Path to Excel file (30-day synthetic dataset)
+excel_path = r"C:\####DIRECTORY####\traffic_accident_prediction_example_30days.xlsx"
+
+# Directory containing the Excel file
+excel_dir = os.path.dirname(excel_path)
+
+# OUTPUT DIRECTORY: all graphs, metrics, sensitivity analysis etc. will go here
+output_dir = os.path.join(excel_dir, "hybrid_outputs")
+os.makedirs(output_dir, exist_ok=True)
+
+print("Excel directory:", excel_dir)
+print("Outputs will be saved in:", output_dir)
+
+# ============ SECTION 1: DATA LOADING & BASIC PREPARATION ============
 
 df = pd.read_excel(excel_path, sheet_name="PipelineB_Corridor")
 df["time"] = pd.to_datetime(df["time"])
@@ -36,9 +51,6 @@ df = df.sort_values("time").reset_index(drop=True)
 
 print("Total rows:", len(df))
 
-# ----------------------------------------------------
-# 2. Prepare tabular features for XGBoost (stage 1)
-# ----------------------------------------------------
 feature_cols_tab = [
     "speed_kmh",
     "flow_veh_h",
@@ -55,7 +67,6 @@ target_col = "label_crash_next"
 
 X_tab = df[feature_cols_tab].values
 y_tab = df[target_col].values
-
 T = len(df)
 
 # Time-based split: 60% train, 20% val, 20% test
@@ -74,10 +85,8 @@ y_test = y_tab[n_train + n_val:]
 
 print(f"Train rows: {len(X_train_tab)}, Val rows: {len(X_val_tab)}, Test rows: {len(X_test_tab)}")
 
+# ============ SECTION 2: STAGE 1 - XGBOOST TRAINING (STATIC CRASH RISK) ============
 
-# ----------------------------------------------------
-# 3. Train XGBoost for crash probability (stage 1)
-# ----------------------------------------------------
 def compute_pos_weight(y):
     pos = np.sum(y == 1)
     neg = np.sum(y == 0)
@@ -89,8 +98,11 @@ def compute_pos_weight(y):
 scale_pos_weight = compute_pos_weight(y_train)
 print(f"XGBoost scale_pos_weight (N_neg/N_pos): {scale_pos_weight:.2f}")
 
-dtrain = xgb.DMatrix(X_train_tab, label=y_train)
-dval = xgb.DMatrix(X_val_tab, label=y_val)
+# IMPORTANT: give feature names to DMatrix so we can get feature importance later
+feature_names = feature_cols_tab
+
+dtrain = xgb.DMatrix(X_train_tab, label=y_train, feature_names=feature_names)
+dval = xgb.DMatrix(X_val_tab, label=y_val, feature_names=feature_names)
 
 params = {
     "objective": "binary:logistic",
@@ -112,40 +124,35 @@ bst = xgb.train(
 )
 
 # Predict XGBoost probabilities for all time steps
-dall = xgb.DMatrix(X_tab)
+dall = xgb.DMatrix(X_tab, feature_names=feature_names)
 df["xgb_score"] = bst.predict(dall)
 
 print("XGBoost stage done. Example scores:")
 print(df[["time", "xgb_score"]].head())
 
+# ============ SECTION 3: BUILD SEQUENCES FOR LSTM (TEMPORAL MODELING) ============
 
-# ----------------------------------------------------
-# 4. Build sequences for LSTM (stage 2)
-# ----------------------------------------------------
 L = 8  # lookback window length
-seq_feature_cols = feature_cols_tab  # can reduce if desired
-
+seq_feature_cols = feature_cols_tab  # features used in sequences in addition to xgb_score
 
 def build_sequences(df_slice, L, seq_feature_cols, target_col, label_name="split"):
     """
-    df_slice: slice of df (train / val / test, time-sorted)
-    returns:
-        X_seq [samples, L, D], y_seq [samples]
+    Build [L]-step sequences for LSTM.
+    df_slice: time-sorted slice of df
+    Returns: X_seq [N_seq, L, D], y_seq [N_seq]
     """
-    arr_feats = df_slice[seq_feature_cols].values          # [T_slice, F]
-    arr_score = df_slice["xgb_score"].values.reshape(-1, 1)  # [T_slice, 1]
-    labels = df_slice[target_col].values                   # [T_slice]
+    arr_feats = df_slice[seq_feature_cols].values           # [T_slice, F]
+    arr_score = df_slice["xgb_score"].values.reshape(-1, 1) # [T_slice, 1]
+    labels = df_slice[target_col].values                    # [T_slice]
 
     T_slice = arr_feats.shape[0]
     X_list = []
     y_list = []
 
     for t in range(L, T_slice):
-        # history window [t-L, ..., t-1]
         window_feats = arr_feats[t - L:t]   # [L, F]
         window_score = arr_score[t - L:t]   # [L, 1]
         window = np.hstack([window_score, window_feats])  # [L, 1+F]
-
         X_list.append(window.astype(np.float32))
         y_list.append(float(labels[t]))  # label at time t
 
@@ -158,16 +165,15 @@ def build_sequences(df_slice, L, seq_feature_cols, target_col, label_name="split
     print(f"{label_name} sequences: X_seq={X_seq.shape}, y_seq={y_seq.shape}")
     return X_seq, y_seq
 
-
 df_train = df.iloc[:n_train].reset_index(drop=True)
-df_val = df.iloc[n_train:n_train + n_val].reset_index(drop=True)
-df_test = df.iloc[n_train + n_val:].reset_index(drop=True)
+df_val   = df.iloc[n_train:n_train + n_val].reset_index(drop=True)
+df_test  = df.iloc[n_train + n_val:].reset_index(drop=True)
 
 X_train_seq, y_train_seq = build_sequences(df_train, L, seq_feature_cols, target_col, label_name="Train")
-X_val_seq, y_val_seq = build_sequences(df_val, L, seq_feature_cols, target_col, label_name="Val")
-X_test_seq, y_test_seq = build_sequences(df_test, L, seq_feature_cols, target_col, label_name="Test")
+X_val_seq,   y_val_seq   = build_sequences(df_val,   L, seq_feature_cols, target_col, label_name="Val")
+X_test_seq,  y_test_seq  = build_sequences(df_test,  L, seq_feature_cols, target_col, label_name="Test")
 
-
+# Simple label stats
 def print_label_stats(name, y_array):
     flat = y_array.ravel()
     unique, counts = np.unique(flat, return_counts=True)
@@ -176,15 +182,12 @@ def print_label_stats(name, y_array):
         print(f"  class {u}: {c} samples")
     print()
 
-
 print_label_stats("Train", y_train_seq)
-print_label_stats("Val", y_val_seq)
-print_label_stats("Test", y_test_seq)
+print_label_stats("Val",   y_val_seq)
+print_label_stats("Test",  y_test_seq)
 
+# ============ SECTION 4: DATALOADERS FOR LSTM TRAINING ============
 
-# ----------------------------------------------------
-# 5. PyTorch Dataset & DataLoader for LSTM stage
-# ----------------------------------------------------
 class SeqDataset(Dataset):
     def __init__(self, X, y):
         self.X = torch.from_numpy(X)  # [B, L, D]
@@ -196,21 +199,17 @@ class SeqDataset(Dataset):
     def __getitem__(self, idx):
         return self.X[idx], self.y[idx]
 
-
 train_ds = SeqDataset(X_train_seq, y_train_seq)
-val_ds = SeqDataset(X_val_seq, y_val_seq)
-test_ds = SeqDataset(X_test_seq, y_test_seq)
+val_ds   = SeqDataset(X_val_seq,   y_val_seq)
+test_ds  = SeqDataset(X_test_seq,  y_test_seq)
 
 train_loader = DataLoader(train_ds, batch_size=64, shuffle=True)
-val_loader = DataLoader(val_ds, batch_size=64, shuffle=False)
-test_loader = DataLoader(test_ds, batch_size=64, shuffle=False)
+val_loader   = DataLoader(val_ds,   batch_size=64, shuffle=False)
+test_loader  = DataLoader(test_ds,  batch_size=64, shuffle=False)
 
+# ============ SECTION 5A: LSTM MODEL DEFINITION (STAGE 2) ============
 
-# ----------------------------------------------------
-# 6. Define LSTM model (stage 2)
-# ----------------------------------------------------
 input_dim = 1 + len(seq_feature_cols)  # xgb_score + features
-
 
 class XGB_LSTM(nn.Module):
     def __init__(self, input_dim, lstm_hidden_dim=64):
@@ -234,14 +233,11 @@ class XGB_LSTM(nn.Module):
         logits = self.fc2(h).squeeze(-1)  # [B]
         return logits
 
-
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model = XGB_LSTM(input_dim=input_dim, lstm_hidden_dim=64).to(device)
 
+# ============ SECTION 5B: LOSS FUNCTION (CLASS-WEIGHTED) & OPTIMIZER ============
 
-# ----------------------------------------------------
-# 7. Class-weighted loss for LSTM stage
-# ----------------------------------------------------
 if len(y_train_seq) > 0:
     classes = np.array([0, 1], dtype=np.int64)
     try:
@@ -263,10 +259,8 @@ pos_weight_tensor = torch.tensor([pos_w], dtype=torch.float32).to(device)
 criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight_tensor)
 optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
+# ============ SECTION 5C: LSTM TRAINING LOOP ============
 
-# ----------------------------------------------------
-# 8. Training loop for LSTM stage
-# ----------------------------------------------------
 def run_epoch(loader, train=True):
     if train:
         model.train()
@@ -298,25 +292,21 @@ def run_epoch(loader, train=True):
         return float("nan")
     return total_loss / total_samples
 
-
-num_epochs = 10  # can increase to 20–30
-
+num_epochs = 10  # increase to 20–30 if needed
 train_losses = []
 val_losses = []
 
 for epoch in range(1, num_epochs + 1):
     train_loss = run_epoch(train_loader, train=True)
-    val_loss = run_epoch(val_loader, train=False)
+    val_loss   = run_epoch(val_loader,   train=False)
 
     train_losses.append(train_loss)
     val_losses.append(val_loss)
 
     print(f"Epoch {epoch}: train_loss={train_loss:.4f}, val_loss={val_loss:.4f}")
 
+# ============ SECTION 6: PERFORMANCE EVALUATION + PLOTS ============
 
-# ----------------------------------------------------
-# 9. Evaluation on test set + plots
-# ----------------------------------------------------
 model.eval()
 all_probs = []
 all_true = []
@@ -325,10 +315,12 @@ with torch.no_grad():
     for X_batch, y_batch in test_loader:
         X_batch = X_batch.to(device)
         y_batch = y_batch.to(device)
-        logits = model(X_batch)               # [B]
-        probs = torch.sigmoid(logits)         # [B]
+        logits = model(X_batch)
+        probs = torch.sigmoid(logits)
         all_probs.append(probs.cpu().numpy())
         all_true.append(y_batch.cpu().numpy())
+
+metrics_lines = []  # we will also save metrics to a text file
 
 if len(all_probs) == 0:
     print("⚠️ No test sequences to evaluate.")
@@ -337,31 +329,36 @@ else:
     y_true_flat = np.concatenate(all_true, axis=0)
 
     print("Test sequence-level shapes:", y_pred_flat.shape, y_true_flat.shape)
+    metrics_lines.append(f"Test sequence-level shapes: {y_pred_flat.shape}, {y_true_flat.shape}")
 
     if len(np.unique(y_true_flat)) > 1:
-        # -------------------------
-        # 1) Classification metrics
-        # -------------------------
+        # --- classification metrics ---
         auc_val = roc_auc_score(y_true_flat, y_pred_flat)
         print(f"Global AUC (LSTM stage): {auc_val:.3f}")
+        metrics_lines.append(f"Global AUC (LSTM stage): {auc_val:.3f}")
 
         for thr in [0.50, 0.40, 0.35, 0.30]:
             y_pred_binary = (y_pred_flat >= thr).astype(int)
             p = precision_score(y_true_flat, y_pred_binary, zero_division=0)
             r = recall_score(y_true_flat, y_pred_binary, zero_division=0)
             f1 = f1_score(y_true_flat, y_pred_binary, zero_division=0)
-            print(f"thr={thr:.2f} -> precision={p:.3f}, recall={r:.3f}, f1={f1:.3f}")
+            line = f"thr={thr:.2f} -> precision={p:.3f}, recall={r:.3f}, f1={f1:.3f}"
+            print(line)
+            metrics_lines.append(line)
 
         thr_rep = 0.40
         y_pred_binary = (y_pred_flat >= thr_rep).astype(int)
+        cls_report = classification_report(
+            y_true_flat, y_pred_binary, digits=3, zero_division=0
+        )
         print(f"\nClassification report (threshold={thr_rep}):")
-        print(classification_report(y_true_flat, y_pred_binary, digits=3, zero_division=0))
+        print(cls_report)
+        metrics_lines.append(f"\nClassification report (threshold={thr_rep}):\n{cls_report}")
 
-        # -------------------------
-        # 2) Continuous risk metrics
-        # -------------------------
+        # --- continuous risk metrics ---
         r2 = r2_score(y_true_flat, y_pred_flat)
-        rmse = mean_squared_error(y_true_flat, y_pred_flat, squared=False)
+        mse = mean_squared_error(y_true_flat, y_pred_flat)  # for older sklearn
+        rmse = float(np.sqrt(mse))
         mae = mean_absolute_error(y_true_flat, y_pred_flat)
 
         print("\n--- Continuous Risk Metrics ---")
@@ -369,24 +366,33 @@ else:
         print(f"RMSE (root mean square error): {rmse:.3f}")
         print(f"MAE  (mean absolute error): {mae:.3f}")
 
-        # -------------------------
-        # 3) Loss curves plot
-        # -------------------------
+        metrics_lines.append("\n--- Continuous Risk Metrics ---")
+        metrics_lines.append(f"R²: {r2:.3f}")
+        metrics_lines.append(f"RMSE: {rmse:.3f}")
+        metrics_lines.append(f"MAE: {mae:.3f}")
+
+        # --- save metrics to text file (THIS IS WHERE METRIC OUTPUT IS SAVED) ---
+        metrics_path = os.path.join(output_dir, "metrics_summary_hybrid.txt")
+        with open(metrics_path, "w") as f:
+            f.write("\n".join(metrics_lines))
+        print("Saved metrics summary to:", metrics_path)
+
+        # --- LOSS CURVES PLOT (SAVED) ---
         epochs_range = range(1, len(train_losses) + 1)
         plt.figure()
         plt.plot(epochs_range, train_losses, label="Train loss")
-        plt.plot(epochs_range, val_losses, label="Validation loss")
+        plt.plot(epochs_range, val_losses,   label="Validation loss")
         plt.xlabel("Epoch")
         plt.ylabel("Loss")
         plt.title("LSTM Training & Validation Loss")
         plt.legend()
         plt.tight_layout()
-        plt.savefig("lstm_loss_curves.png", dpi=300)
+        loss_plot_path = os.path.join(output_dir, "lstm_loss_curves.png")
+        plt.savefig(loss_plot_path, dpi=300)
         plt.close()
+        print("Saved loss curves to:", loss_plot_path)
 
-        # -------------------------
-        # 4) ROC curve plot
-        # -------------------------
+        # --- ROC CURVE PLOT (SAVED) ---
         fpr, tpr, _ = roc_curve(y_true_flat, y_pred_flat)
         roc_auc = auc_val
 
@@ -398,12 +404,12 @@ else:
         plt.title("ROC Curve - Hybrid XGBoost–LSTM")
         plt.legend()
         plt.tight_layout()
-        plt.savefig("roc_curve_hybrid.png", dpi=300)
+        roc_path = os.path.join(output_dir, "roc_curve_hybrid.png")
+        plt.savefig(roc_path, dpi=300)
         plt.close()
+        print("Saved ROC curve to:", roc_path)
 
-        # -------------------------
-        # 5) Precision-Recall curve
-        # -------------------------
+        # --- PRECISION-RECALL CURVE PLOT (SAVED) ---
         prec, rec, _ = precision_recall_curve(y_true_flat, y_pred_flat)
         ap = average_precision_score(y_true_flat, y_pred_flat)
 
@@ -414,12 +420,12 @@ else:
         plt.title("Precision–Recall Curve - Hybrid XGBoost–LSTM")
         plt.legend()
         plt.tight_layout()
-        plt.savefig("pr_curve_hybrid.png", dpi=300)
+        pr_path = os.path.join(output_dir, "pr_curve_hybrid.png")
+        plt.savefig(pr_path, dpi=300)
         plt.close()
+        print("Saved Precision–Recall curve to:", pr_path)
 
-        # -------------------------
-        # 6) Risk distribution by class
-        # -------------------------
+        # --- RISK DISTRIBUTION HISTOGRAM (SAVED) ---
         plt.figure()
         plt.hist(
             y_pred_flat[y_true_flat == 0],
@@ -438,13 +444,55 @@ else:
         plt.title("Predicted Crash Risk Distribution by Class")
         plt.legend()
         plt.tight_layout()
-        plt.savefig("risk_histogram_by_class.png", dpi=300)
+        hist_path = os.path.join(output_dir, "risk_histogram_by_class.png")
+        plt.savefig(hist_path, dpi=300)
         plt.close()
+        print("Saved risk histogram to:", hist_path)
 
     else:
-        print("Warning: Only one class present in test labels; AUC/F1 not defined.")
+        print("Warning: Only one class present; AUC/F1 not defined.")
 
-    # Sample predictions
+    # Sample predictions to console (not saved to file)
     print("\nSample predictions vs true (first 10 sequences):")
     for i in range(min(10, len(y_pred_flat))):
         print(f"Seq {i}: pred={y_pred_flat[i]:.3f}, true={int(y_true_flat[i])}")
+
+# ============ SECTION 7: SENSITIVITY ANALYSIS (FEATURE IMPORTANCE) ============
+
+# Here we perform sensitivity analysis using XGBoost feature importance (gain).
+# This ranks input parameters from most to least important based on how much
+# they contribute to reducing loss in the XGBoost stage.
+
+print("\n=== SENSITIVITY ANALYSIS: XGBOOST FEATURE IMPORTANCE (GAIN) ===")
+
+# XGBoost importance as a dictionary: {feature_name: importance_value}
+importance_dict = bst.get_score(importance_type="gain")
+
+# Ensure all features appear (missing -> 0)
+importance_list = []
+for fname in feature_names:
+    gain = importance_dict.get(fname, 0.0)
+    importance_list.append((fname, gain))
+
+# Sort from highest to lowest importance
+importance_list.sort(key=lambda x: x[1], reverse=True)
+
+# Convert to DataFrame and save
+fi_df = pd.DataFrame(importance_list, columns=["feature", "gain_importance"])
+print(fi_df)
+
+fi_csv_path = os.path.join(output_dir, "xgb_feature_importance_gain.csv")
+fi_df.to_csv(fi_csv_path, index=False)
+print("Saved XGBoost feature importance (gain) to:", fi_csv_path)
+
+# Plot feature importance (horizontal bar chart)
+plt.figure(figsize=(8, 4))
+plt.barh(fi_df["feature"], fi_df["gain_importance"])
+plt.gca().invert_yaxis()
+plt.xlabel("Gain-based importance")
+plt.title("XGBoost Feature Importance (Gain)")
+plt.tight_layout()
+fi_plot_path = os.path.join(output_dir, "xgb_feature_importance_gain.png")
+plt.savefig(fi_plot_path, dpi=300)
+plt.close()
+print("Saved feature importance plot to:", fi_plot_path)
